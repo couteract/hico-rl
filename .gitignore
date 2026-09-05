@@ -1,0 +1,32 @@
+# Training and evaluation outputs
+hico-rl-runs/
+runs/
+outputs/
+wandb/
+
+# Model/data artifacts
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.mp4
+*.avi
+*.zip
+*.tar
+*.tar.gz
+
+# Python and tooling caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Local environment and editor files
+.env
+.venv/
+venv/
+.idea/
+.vscode/
+*.swp
