@@ -179,7 +179,10 @@ outputs/
 *.part
 AGENTS.md
 
-# Large experiment artifacts (keep outside this code repository)
+# HiMem-RL local and experiment assets (never publish from a working machine)
+outputs/
+artifacts/
+reports/raw/
 checkpoints/
 *.safetensors
 *.ckpt
@@ -195,3 +198,6 @@ checkpoints/
 *.tar
 *.tar.gz
 *.zip
+.env*
+*_private.*
+private/

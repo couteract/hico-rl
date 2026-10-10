@@ -79,6 +79,72 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+def compute_smolvla_action_loss(
+    squared_errors: Tensor,
+    action_is_pad: Tensor | None,
+    *,
+    actual_action_dim: int,
+    gripper_action_dim: int,
+    gripper_loss_weight: float,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Compute the valid-time, unpadded arm/gripper action loss.
+
+    `action_is_pad` follows the LeRobot dataset contract (`bool [B,L]`, True
+    for out-of-episode action queries). It is mandatory for this chunked loss.
+    """
+    if squared_errors.ndim != 3:
+        raise ValueError(f"Expected squared_errors [B,L,D], got {tuple(squared_errors.shape)}.")
+    if action_is_pad is None:
+        raise KeyError("Missing 'action_is_pad'; cannot establish valid chunk timesteps.")
+    if action_is_pad.dtype != torch.bool or tuple(action_is_pad.shape) != tuple(squared_errors.shape[:2]):
+        raise ValueError(
+            "action_is_pad must be bool [B,L] aligned with the action chunk; "
+            f"got dtype={action_is_pad.dtype}, shape={tuple(action_is_pad.shape)}."
+        )
+    if not 1 < actual_action_dim <= squared_errors.shape[-1]:
+        raise ValueError(
+            f"actual_action_dim={actual_action_dim} must be in [2,{squared_errors.shape[-1]}]."
+        )
+    if not 0 < gripper_action_dim < actual_action_dim:
+        raise ValueError(
+            "Expected non-empty arm and gripper slices within the actual action dimensions; "
+            f"got gripper_action_dim={gripper_action_dim}, actual_action_dim={actual_action_dim}."
+        )
+    if gripper_loss_weight < 0:
+        raise ValueError("gripper_loss_weight must be non-negative.")
+
+    valid_time = ~action_is_pad.to(device=squared_errors.device)
+    valid_count = valid_time.sum()
+    if int(valid_count.item()) == 0:
+        raise ValueError("Action chunk contains no valid timestep (all action_is_pad=True).")
+
+    # Crop before any reduction so model-only dimensions 6:32 cannot affect
+    # the loss, monitoring values, or gradients.
+    actual_errors = squared_errors[..., :actual_action_dim]
+    valid = valid_time.to(dtype=actual_errors.dtype).unsqueeze(-1)
+    arm_errors = actual_errors[..., :gripper_action_dim]
+    gripper_errors = actual_errors[..., gripper_action_dim:]
+    valid_denominator = valid_time.sum().to(dtype=actual_errors.dtype)
+    arm_loss = (arm_errors * valid).sum() / (gripper_action_dim * valid_denominator)
+    gripper_loss = (gripper_errors * valid).sum() / (
+        (actual_action_dim - gripper_action_dim) * valid_denominator
+    )
+    total_loss = (arm_loss + gripper_loss_weight * gripper_loss) / (1.0 + gripper_loss_weight)
+
+    valid_by_time = valid_time.sum(dim=0).clamp_min(1).to(dtype=actual_errors.dtype)
+    mse_per_timestep = (actual_errors.sum(dim=-1) * valid_time.to(actual_errors.dtype)).sum(dim=0) / (
+        actual_action_dim * valid_by_time
+    )
+    mse_per_dim = (actual_errors * valid).sum(dim=(0, 1)) / valid_denominator
+    return total_loss, {
+        "arm_loss": arm_loss,
+        "gripper_loss": gripper_loss,
+        "mse_per_timestep": mse_per_timestep,
+        "mse_per_dim": mse_per_dim,
+        "valid_timestep_count": valid_count,
+    }
+
+
 def create_sinusoidal_pos_embedding(
     time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
@@ -393,47 +459,30 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
-        actions_is_pad = batch.get("actions_id_pad")
+        actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
-        # ✅ FIX Bug #2: 传递actions_is_pad用于检测episode边界并重置Mamba历史
+        # The dataset emits `action_is_pad` for the ACTION delta query. Pass the
+        # exact contract key through the model and use it in the supervised loss.
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time, actions_is_pad)
         loss_dict["losses_after_forward"] = losses.clone()
-
-        if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad
-            losses = losses * in_episode_bound.unsqueeze(-1)
-            loss_dict["losses_after_in_ep_bound"] = losses.clone()
-
-        # Remove padding
-        losses = losses[:, :, : self.config.max_action_dim]
-        loss_dict["losses_after_rm_padding"] = losses.clone()
-
-        # ✅ 专家修复：分离关节和夹爪loss，避免夹爪被淹没
-        # 🔥 修复：改用加权平均而非错误的加法（避免loss爆炸）
-        # 原理：在未加权的losses.mean()中，夹爪只占1/7（14.3%）维度
-        # 梯度会被关节（6/7=85.7%）淹没，导致机器人学会移动但学不会抓取
-        gripper_dim = self.config.gripper_action_dim
-        if gripper_dim == -1:
-            gripper_dim = self.config.max_action_dim - 1
-
-        joint_losses = losses[:, :, :gripper_dim]  # [B, L, joint_dim]
-        gripper_losses = losses[:, :, gripper_dim:]  # [B, L, 1 or 2]
-
-        # 🔥 加权平均公式（保持loss量级，避免爆炸）
-        # 之前错误：mse_loss = joint + 5*gripper（如果gripper=0.5，总loss=2.6爆炸）
-        # 现在正确：mse_loss = (joint + 5*gripper) / 6（保持loss在合理范围）
-        weight_sum = 1.0 + self.config.gripper_loss_weight
-        mse_loss = (joint_losses.mean() + self.config.gripper_loss_weight * gripper_losses.mean()) / weight_sum
+        actual_action_dim, gripper_dim = self.config.resolve_action_loss_contract()
+        mse_loss, loss_components = compute_smolvla_action_loss(
+            losses,
+            actions_is_pad,
+            actual_action_dim=actual_action_dim,
+            gripper_action_dim=gripper_dim,
+            gripper_loss_weight=self.config.gripper_loss_weight,
+        )
 
         # 记录详细监控指标
         loss_dict["mse_loss"] = mse_loss.item()
-        loss_dict["joint_loss"] = joint_losses.mean().item()  # 新增：关节loss
-        loss_dict["gripper_loss"] = gripper_losses.mean().item()  # 新增：夹爪loss
+        loss_dict["joint_loss"] = loss_components["arm_loss"].item()
+        loss_dict["gripper_loss"] = loss_components["gripper_loss"].item()
 
-        # ✅ 详细监控每个时间步和维度的误差
-        # 这有助于诊断哪个时间步或哪个动作维度（关节/夹爪）学习困难
-        loss_dict["mse_per_timestep"] = losses.mean(dim=(0, 2)).tolist()  # [L] 每个时间步的平均loss
-        loss_dict["mse_per_dim"] = losses.mean(dim=(0, 1)).tolist()  # [D] 每个维度的平均loss
+        # These monitoring values use the same valid-time and actual-dimension
+        # contract as the scalar supervised loss.
+        loss_dict["mse_per_timestep"] = loss_components["mse_per_timestep"].tolist()
+        loss_dict["mse_per_dim"] = loss_components["mse_per_dim"].tolist()
 
         loss = mse_loss
         loss_dict["loss"] = loss.item()

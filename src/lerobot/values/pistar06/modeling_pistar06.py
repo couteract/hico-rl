@@ -261,11 +261,13 @@ class Pistar06Model(nn.Module):
         self.cfg = cfg
         self.model_dtype = _resolve_load_dtype(cfg.dtype)
 
-        self.vision_encoder = AutoModel.from_pretrained(
+        self.vision_encoder, vision_loading_info = AutoModel.from_pretrained(
             cfg.vision_repo_id,
             revision=cfg.vision_revision,
             torch_dtype=self.model_dtype,
+            output_loading_info=True,
         )
+        _validate_loading_info(cfg.vision_repo_id, "vision_encoder", vision_loading_info)
         self.language_model = _load_language_model(
             repo_id=cfg.language_repo_id,
             revision=cfg.language_revision,
@@ -320,6 +322,15 @@ class Pistar06Model(nn.Module):
             _freeze_module(self.language_model)
         if cfg.freeze_vision_encoder:
             _freeze_module(self.vision_encoder)
+
+    def train(self, mode: bool = True):
+        """Keep frozen backbone dropout off when training the value head."""
+        super().train(mode)
+        if self.cfg.freeze_vision_encoder:
+            self.vision_encoder.eval()
+        if self.cfg.freeze_language_model:
+            self.language_model.eval()
+        return self
 
     def _encode_images(self, flat_images: Tensor) -> Tensor:
         if hasattr(self.vision_encoder, "get_image_features"):
@@ -614,7 +625,7 @@ class Pistar06Policy(PreTrainedPolicy):
         )
 
     def get_optim_params(self):
-        return self.parameters()
+        return (parameter for parameter in self.parameters() if parameter.requires_grad)
 
     def reset(self):
         return
@@ -680,7 +691,10 @@ class Pistar06Policy(PreTrainedPolicy):
                 length=ep_length,
                 success=ep_success,
             )
-            task_max_length[task_index] = max(task_max_length.get(task_index, 0), ep_length)
+            if targets_cfg.h_ref_frames is not None:
+                task_max_length[task_index] = int(targets_cfg.h_ref_frames)
+            else:
+                task_max_length[task_index] = max(task_max_length.get(task_index, 0), ep_length)
 
         value_targets = compute_normalized_value_targets(
             episode_indices=episode_indices,

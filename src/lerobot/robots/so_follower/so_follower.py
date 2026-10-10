@@ -46,6 +46,15 @@ class SOFollower(Robot):
 
     def __init__(self, config: SOFollowerRobotConfig):
         super().__init__(config)
+        # The SO101 cache predates the shared SOFollower class name.
+        if config.calibration_dir is None and not self.calibration_fpath.is_file():
+            so101_fpath = self.calibration_dir.parent / "so101_follower" / f"{self.id}.json"
+            if so101_fpath.is_file():
+                self.calibration_dir = so101_fpath.parent
+                self.calibration_fpath = so101_fpath
+                self._load_calibration()
+        if self.calibration:
+            logger.info("Loaded follower calibration from %s", self.calibration_fpath)
         self.config = config
         # choose normalization mode depending on config if available
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100

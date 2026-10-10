@@ -235,6 +235,8 @@ class RecordConfig:
     collector_policy_id_human: str = "human"
     # ACP inference controls for policy-driven recording.
     acp_inference: ACPInferenceConfig = field(default_factory=ACPInferenceConfig)
+    # Optional arm-only continuity blend at policy action-chunk boundaries.
+    action_chunk_continuity_enabled: bool = False
     # Retry timeout for transient communication errors (seconds). Set to 0 to fail immediately.
     communication_retry_timeout_s: float = 2.0
     # Sleep interval between communication retries (seconds).
@@ -325,6 +327,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         raise ValueError(
             "`require_episode_success_label=true` requires `enable_episode_outcome_labeling=true`."
         )
+    if cfg.action_chunk_continuity_enabled:
+        if cfg.policy is None:
+            raise ValueError("`action_chunk_continuity_enabled=true` requires a policy.")
+        if cfg.resume:
+            raise ValueError("Chunk-continuity recording requires a fresh dataset (resume=false).")
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
         init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
@@ -363,6 +370,50 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             "shape": (1,),
             "names": ["collector_policy_id"],
         }
+    if cfg.action_chunk_continuity_enabled:
+        action_names = list(dataset_features[ACTION]["names"])
+        dataset_features.update(
+            {
+                "complementary_info.action_queue_cursor": {
+                    "dtype": "int64", "shape": (1,), "names": ["action_queue_cursor"]
+                },
+                "complementary_info.action_chunk_boundary": {
+                    "dtype": "int64", "shape": (1,), "names": ["action_chunk_boundary"]
+                },
+                "complementary_info.boundary_continuity_applied": {
+                    "dtype": "int64", "shape": (1,), "names": ["boundary_continuity_applied"]
+                },
+                "complementary_info.continuity_blend_weight": {
+                    "dtype": "float32", "shape": (1,), "names": ["continuity_blend_weight"]
+                },
+                "complementary_info.policy_inference_latency_s": {
+                    "dtype": "float32", "shape": (1,), "names": ["policy_inference_latency_s"]
+                },
+                "complementary_info.policy_action_valid": {
+                    "dtype": "int64", "shape": (1,), "names": ["policy_action_valid"]
+                },
+                "complementary_info.continuity_intended_action": {
+                    "dtype": "float32",
+                    "shape": (len(action_names),),
+                    "names": action_names,
+                },
+                "complementary_info.controller_input_action": {
+                    "dtype": "float32",
+                    "shape": (len(action_names),),
+                    "names": action_names,
+                },
+                "complementary_info.follower_feedback_state": {
+                    "dtype": "float32",
+                    "shape": (len(action_names),),
+                    "names": action_names,
+                },
+                "complementary_info.robot_returned_goal_action": {
+                    "dtype": "float32",
+                    "shape": (len(action_names),),
+                    "names": action_names,
+                },
+            }
+        )
 
     dataset = None
     listener = None
@@ -475,6 +526,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     collector_policy_id_policy=collector_policy_id_policy,
                     collector_policy_id_human=collector_policy_id_human,
                     acp_inference=cfg.acp_inference,
+                    action_chunk_continuity_enabled=cfg.action_chunk_continuity_enabled,
                     communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
                 )
@@ -491,6 +543,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                             "Episode %s has no explicit success/failure label, defaulting to '%s'.",
                             dataset.num_episodes,
                             episode_success,
+                        )
+                    elif episode_success is None:
+                        logging.warning(
+                            "Episode %s has no success/failure label; saving outcome as unknown (null). "
+                            "Press '%s' for success or '%s' for failure during recording.",
+                            dataset.num_episodes,
+                            cfg.episode_success_key,
+                            cfg.episode_failure_key,
                         )
 
                 on_episode_outcome = getattr(cfg, "_on_record_episode_outcome", None)
@@ -524,6 +584,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         collector_policy_id_policy=collector_policy_id_policy,
                         collector_policy_id_human=collector_policy_id_human,
                         acp_inference=cfg.acp_inference,
+                        action_chunk_continuity_enabled=cfg.action_chunk_continuity_enabled,
                         communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                         communication_retry_interval_s=cfg.communication_retry_interval_s,
                     )

@@ -39,6 +39,15 @@ class SOLeader(Teleoperator):
 
     def __init__(self, config: SOLeaderTeleopConfig):
         super().__init__(config)
+        # The SO101 cache predates the shared SOLeader class name.
+        if config.calibration_dir is None and not self.calibration_fpath.is_file():
+            so101_fpath = self.calibration_dir.parent / "so101_leader" / f"{self.id}.json"
+            if so101_fpath.is_file():
+                self.calibration_dir = so101_fpath.parent
+                self.calibration_fpath = so101_fpath
+                self._load_calibration()
+        if self.calibration:
+            logger.info("Loaded leader calibration from %s", self.calibration_fpath)
         self.config = config
         self._manual_control_enabled = True
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100

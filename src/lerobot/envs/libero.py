@@ -327,13 +327,20 @@ class LiberoEnv(_GymEnvBase):
     def reset(self, seed=None, **kwargs):
         super().reset(seed=seed)
         self._env.seed(seed)
-        if self.init_states and self._init_states is not None:
-            # Preserve the 5090 training/evaluation protocol: LIBERO's saved
-            # simulator state is selected before reset, then reset applies it.
-            self._env.set_init_state(self._init_states[self.init_state_id % len(self._init_states)])
+        options = kwargs.get("options") or {}
+        requested = options.get("init_state_id")
+        if requested is not None:
+            if self._init_states is None or not 0 <= int(requested) < len(self._init_states):
+                raise ValueError(f"Invalid explicit init_state_id: {requested}")
+            self.init_state_id = int(requested)
         raw_obs = self._env.reset()
+        self.active_init_state_id = None
         if self.init_states and self._init_states is not None:
-            self.init_state_id += self._reset_stride  # Change init_state_id when reset
+            self.active_init_state_id = self.init_state_id % len(self._init_states)
+            # Installed LIBERO applies state immediately; reset BEFORE applying it.
+            raw_obs = self._env.set_init_state(self._init_states[self.active_init_state_id])
+            self.init_state_id += self._reset_stride
+        self._elapsed_steps = 0
 
         # After reset, objects may be unstable (slightly floating, intersecting, etc.).
         # Step the simulator with a no-op action for a few frames so everything settles.
@@ -350,7 +357,7 @@ class LiberoEnv(_GymEnvBase):
         else:
             raise ValueError(f"Invalid control mode: {self.control_mode}")
         observation = self._format_raw_obs(raw_obs)
-        info = {"is_success": False}
+        info = {"is_success": False, "init_state_id": self.active_init_state_id}
         return observation, info
 
     def step(self, action: np.ndarray) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
@@ -372,15 +379,15 @@ class LiberoEnv(_GymEnvBase):
             }
         )
         observation = self._format_raw_obs(raw_obs)
-        if terminated:
+        self._elapsed_steps += 1
+        truncated = self._elapsed_steps >= self._max_episode_steps and not terminated
+        if terminated or truncated:
             info["final_info"] = {
                 "task": self.task,
                 "task_id": self.task_id,
                 "done": bool(done),
                 "is_success": bool(is_success),
             }
-            self.reset()
-        truncated = False
         return observation, reward, terminated, truncated, info
 
     def close(self):

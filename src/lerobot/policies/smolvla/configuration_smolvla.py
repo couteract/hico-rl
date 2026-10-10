@@ -43,8 +43,13 @@ class SmolVLAConfig(PreTrainedConfig):
     max_state_dim: int = 32
     max_action_dim: int = 32
 
+    # Width of the real action feature before model padding. When unset, the
+    # width is resolved from output_features[ACTION].shape at loss time.
+    actual_action_dim: int | None = None
+
     # Gripper dimension for weighted loss calculation
-    # -1 means auto-detect (use last dimension as gripper)
+    # This is the gripper's index in the unpadded action vector. -1 means the
+    # final actual action dimension; model padding is never part of this split.
     gripper_action_dim: int = -1
 
     # Image preprocessing
@@ -190,6 +195,39 @@ class SmolVLAConfig(PreTrainedConfig):
                 shape=(3, 480, 640),
             )
             self.input_features[key] = empty_camera
+
+    def resolve_action_loss_contract(self) -> tuple[int, int]:
+        """Return (actual action width, gripper index) from explicit metadata.
+
+        The action width is intentionally not inferred from max_action_dim,
+        which is the wider model tensor and may include padding dimensions.
+        """
+        action_feature = (self.output_features or {}).get("action")
+        feature_shape = getattr(action_feature, "shape", None)
+        if feature_shape is None and isinstance(action_feature, dict):
+            feature_shape = action_feature.get("shape")
+        metadata_dim = int(feature_shape[0]) if feature_shape else None
+        actual_dim = self.actual_action_dim if self.actual_action_dim is not None else metadata_dim
+        if actual_dim is None or actual_dim <= 1:
+            raise ValueError(
+                "SmolVLA loss requires actual_action_dim or output_features['action'].shape metadata."
+            )
+        actual_dim = int(actual_dim)
+        if metadata_dim is not None and metadata_dim != actual_dim:
+            raise ValueError(
+                f"actual_action_dim={actual_dim} disagrees with action feature width {metadata_dim}."
+            )
+        if actual_dim > self.max_action_dim:
+            raise ValueError(
+                f"actual_action_dim={actual_dim} exceeds max_action_dim={self.max_action_dim}."
+            )
+        gripper_index = actual_dim - 1 if self.gripper_action_dim == -1 else self.gripper_action_dim
+        if not 0 < gripper_index < actual_dim:
+            raise ValueError(
+                "The weighted arm/gripper loss requires a non-empty arm and gripper slice; "
+                f"resolved index={gripper_index}, actual_action_dim={actual_dim}."
+            )
+        return actual_dim, int(gripper_index)
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(

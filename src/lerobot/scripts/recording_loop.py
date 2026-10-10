@@ -43,6 +43,13 @@ from lerobot.scripts.recording_hil import (
     _capture_policy_runtime_state,
     _predict_policy_action_with_acp_inference,
 )
+from lerobot.scripts.action_chunk_continuity import (
+    ActionChunkContinuity,
+    continuity_record_fields,
+    policy_queue_cursor,
+    policy_queue_is_empty,
+    should_stop_continuity_pilot,
+)
 from lerobot.teleoperators import Teleoperator, koch_leader, omx_leader, so_leader
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -112,6 +119,7 @@ def record_loop(
     collector_policy_id_policy: str = "policy",
     collector_policy_id_human: str = "human",
     acp_inference: ACPInferenceConfig | None = None,
+    action_chunk_continuity_enabled: bool = False,
     communication_retry_timeout_s: float = 2.0,
     communication_retry_interval_s: float = 0.1,
 ):
@@ -156,6 +164,9 @@ def record_loop(
         else:
             action_feature_names = list(robot.action_features)
     zero_policy_action = dict.fromkeys(action_feature_names, 0.0)
+    continuity = ActionChunkContinuity(enabled=action_chunk_continuity_enabled)
+    if action_chunk_continuity_enabled and len(action_feature_names) != 6:
+        raise ValueError("Action chunk continuity currently requires the SO-101 6D action contract.")
     has_teleop = isinstance(teleop, (Teleoperator, list))
     intervention_enabled = intervention_state_machine_enabled and policy is not None and has_teleop
     intervention_state = INTERVENTION_STATE_POLICY
@@ -187,6 +198,7 @@ def record_loop(
         policy.reset()
         preprocessor.reset()
         postprocessor.reset()
+    continuity.reset()
 
     cond_policy_runtime_state: dict[str, Any] | None = None
     uncond_policy_runtime_state: dict[str, Any] | None = None
@@ -282,12 +294,21 @@ def record_loop(
         # Get action from policy and/or teleop
         act_processed_policy: RobotAction | None = None
         act_processed_teleop: RobotAction | None = None
+        raw_policy_action: RobotAction | None = None
+        action_queue_cursor = -1
+        action_chunk_boundary = False
+        boundary_continuity_applied = False
+        continuity_blend_weight = 0.0
+        policy_inference_latency_s = 0.0
+        continuity_intended_action: RobotAction | None = None
         if (
             policy is not None
             and preprocessor is not None
             and postprocessor is not None
             and not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)
         ):
+            action_chunk_boundary = policy_queue_is_empty(policy)
+            inference_start = time.perf_counter()
             policy_action = _predict_policy_action_with_acp_inference(
                 observation_frame=observation_frame,
                 policy=policy,
@@ -301,7 +322,21 @@ def record_loop(
                 cond_runtime_state=cond_policy_runtime_state,
                 uncond_runtime_state=uncond_policy_runtime_state,
             )
-            act_processed_policy = make_robot_action(policy_action, dataset.features)
+            raw_policy_action = make_robot_action(policy_action, dataset.features)
+            act_processed_policy = raw_policy_action
+            n_action_steps = int(getattr(policy.config, "n_action_steps", 1))
+            action_queue_cursor = policy_queue_cursor(policy, n_action_steps)
+            if action_chunk_continuity_enabled:
+                policy_inference_latency_s = time.perf_counter() - inference_start if action_chunk_boundary else 0.0
+                raw_vector = np.asarray([raw_policy_action[name] for name in action_feature_names], dtype=np.float64)
+                continuity_result = continuity.process(raw_vector, chunk_boundary=action_chunk_boundary)
+                boundary_continuity_applied = continuity_result.blended
+                continuity_blend_weight = continuity_result.blend_weight
+                act_processed_policy = {
+                    name: float(continuity_result.action[index])
+                    for index, name in enumerate(action_feature_names)
+                }
+            continuity_intended_action = act_processed_policy
 
         if isinstance(teleop, Teleoperator):
             act = run_with_connection_retry("teleop.get_action", teleop.get_action)
@@ -383,11 +418,18 @@ def record_loop(
                 lambda robot_action_to_send=robot_action_to_send: robot.send_action(robot_action_to_send),
             )
 
+        if action_chunk_continuity_enabled:
+            sent_vector = np.asarray([_sent_action[name] for name in action_feature_names], dtype=np.float64)
+            continuity.note_sent(sent_vector)
+
         # Write to dataset
         if dataset is not None:
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+            action_to_store = _sent_action if action_chunk_continuity_enabled else action_values
+            action_frame = build_dataset_frame(dataset.features, action_to_store, prefix=ACTION)
             policy_action_frame = build_dataset_frame(
-                dataset.features, policy_action_for_storage, prefix="complementary_info.policy_action"
+                dataset.features,
+                raw_policy_action if raw_policy_action is not None else policy_action_for_storage,
+                prefix="complementary_info.policy_action",
             )
             frame = {**observation_frame, **action_frame, **policy_action_frame, "task": single_task}
 
@@ -403,6 +445,36 @@ def record_loop(
                     policy_id=collector_policy_id_policy,
                     human_id=collector_policy_id_human,
                 )
+            if action_chunk_continuity_enabled:
+                intended = continuity_intended_action if continuity_intended_action is not None else action_values
+                raw_vector = (
+                    None
+                    if raw_policy_action is None
+                    else np.asarray([raw_policy_action[name] for name in action_feature_names], dtype=np.float32)
+                )
+                returned_vector = np.asarray(
+                    [_sent_action[name] for name in action_feature_names], dtype=np.float32
+                )
+                frame.update(
+                    continuity_record_fields(
+                        raw_policy_action=raw_vector,
+                        continuity_intended_action=np.asarray(
+                            [intended[name] for name in action_feature_names], dtype=np.float32
+                        ),
+                        controller_input_action=np.asarray(
+                            [robot_action_to_send[name] for name in action_feature_names], dtype=np.float32
+                        ),
+                        robot_returned_goal_action=returned_vector,
+                        follower_feedback_state_pre_action=np.asarray(
+                            [obs_processed[name] for name in action_feature_names], dtype=np.float32
+                        ),
+                        queue_cursor=action_queue_cursor,
+                        queue_refill=action_chunk_boundary,
+                        blend_applied=boundary_continuity_applied,
+                        blend_alpha=continuity_blend_weight,
+                        inference_latency_s=policy_inference_latency_s,
+                    )
+                )
             dataset.add_frame(frame)
 
         if display_data:
@@ -412,6 +484,13 @@ def record_loop(
 
         if intervention_state == INTERVENTION_STATE_RELEASE:
             intervention_state = INTERVENTION_STATE_POLICY
+
+        if should_stop_continuity_pilot(
+            action_chunk_continuity_enabled,
+            intervention_state == INTERVENTION_STATE_ACTIVE,
+        ):
+            logging.warning("Continuity pilot stopped after the first safety takeover frame.")
+            break
 
         dt_s = time.perf_counter() - start_loop_t
         precise_sleep(max(1 / fps - dt_s, 0.0))

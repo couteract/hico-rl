@@ -29,6 +29,7 @@ class ValueTargetsConfig:
     default_success: str = "failure"
     c_fail_coef: float = 1.0
     target_field: str = "observation.value_target"
+    h_ref_frames: int | None = None
 
     def validate(self) -> None:
         normalized_default = normalize_episode_success_label(self.default_success)
@@ -40,6 +41,8 @@ class ValueTargetsConfig:
             raise ValueError("'targets.success_field' must be non-empty.")
         if self.c_fail_coef < 0:
             raise ValueError("'targets.c_fail_coef' must be non-negative.")
+        if self.h_ref_frames is not None and self.h_ref_frames <= 0:
+            raise ValueError("'targets.h_ref_frames' must be positive when specified.")
         if not self.target_field.startswith("observation."):
             raise ValueError(
                 "'targets.target_field' must start with 'observation.' to survive processor conversion."
